@@ -125,13 +125,16 @@ Reviewer and Admin users should sign out after completing their work, especially
 ## Reminders and Useful Facts
 
 - Power Tool records are stored in PostgreSQL when the health response shows `"provider":"postgresql"`.
+- Docker and the website start normally even when PostgreSQL is unreachable.
+- While PostgreSQL is unavailable, the system uses the local JSON copy stored in the Docker volume. Registration, review, QR, Builder, account, and usage functions remain available.
+- The backend retries PostgreSQL automatically. Local changes made during the outage are merged into PostgreSQL after the connection returns, then PostgreSQL becomes the active provider again.
 - The application creates and updates its required tables automatically when the configured database user has sufficient permissions.
 - Visitor logs are stored in `app."PowerTool-logs"`.
 - Visitor logging is session-based: one browser or device session updates one database row instead of creating a new row for every action.
 - Refreshing the same browser tab retains the session. Closing the session and opening the application again creates a new session.
 - QR and checklist activity updates usage totals without creating separate action rows in the session-log table.
 - Some database timestamps may appear earlier than the current Manila time because of the PostgreSQL server clock. The application currently leaves these timestamps as recorded and does not change the database-wide timezone.
-- Application data survives container rebuilds while PostgreSQL remains available. Do not use `docker compose down -v` as a routine restart command.
+- The local fallback copy survives container rebuilds in the `power_tool_data` Docker volume. Do not use `docker compose down -v` as a routine restart command.
 
 ## Running the System with Docker
 
@@ -144,7 +147,7 @@ This section is for the person responsible for starting the Power Tool system.
 - The complete project folder, including `docker-compose.yml`
 - A configured `.env` file
 
-The PostgreSQL server and main database must already exist before starting the application. The configured PostgreSQL user must have permission to use or create the `app` schema and the required tables and indexes.
+The PostgreSQL server and main database must already exist for normal operation. They do not need to be reachable at the exact moment Docker starts: the application remains running and reconnects automatically. The configured PostgreSQL user must have permission to use or create the `app` schema and the required tables and indexes.
 
 ### Configure `.env`
 
@@ -162,6 +165,7 @@ POSTGRES_SCHEMA=app
 POSTGRES_POOL_MAX=20
 POSTGRES_CONNECT_TIMEOUT_MS=10000
 POSTGRES_IDLE_TIMEOUT_MS=30000
+POSTGRES_RETRY_INTERVAL_MS=15000
 POSTGRES_SSL=false
 
 INITIAL_REVIEWER_USERNAME=reviewer
@@ -201,13 +205,24 @@ The Power Tool and Nginx containers should show as running or healthy.
 curl.exe http://localhost:5057/api/health
 ```
 
-The response must contain:
+When PostgreSQL is reachable, the response contains:
 
 ```json
 "provider": "postgresql"
+"status": "connected"
 ```
 
-If it shows `"provider":"json"`, confirm that `.env` contains `POSTGRES_ENABLED=true`, then recreate the containers.
+If PostgreSQL is temporarily unreachable, the application remains healthy and the response contains:
+
+```json
+"provider": "json"
+"configuredProvider": "postgresql"
+"status": "local-fallback"
+"fallback": true
+"retrying": true
+```
+
+This is expected while the database network is unavailable. The application continues using its local Docker volume and reconnects automatically after network access returns.
 
 ### Open the System
 
@@ -293,7 +308,9 @@ Check the health response:
 curl.exe http://localhost:5057/api/health
 ```
 
-It must show `"provider":"postgresql"`. If it shows `"provider":"json"`, add or correct this value in `.env`:
+If it shows `"provider":"json"` together with `"fallback":true`, the PostgreSQL server is currently unreachable and the application is safely using its local copy. Reconnect the computer to the database network and wait for the automatic retry.
+
+If `"configuredProvider"` is also `"json"`, add or correct this value in `.env`:
 
 ```env
 POSTGRES_ENABLED=true
@@ -328,7 +345,8 @@ docker compose up -d --force-recreate
 
 ### Session Logs Are Empty
 
-- Confirm that the application is using PostgreSQL.
+- Check `/api/health`. While `"provider":"json"`, sessions are retained in the local fallback data and are added to PostgreSQL after reconnection.
+- Wait until the health response shows `"provider":"postgresql"` before checking the PostgreSQL log table.
 - Open or refresh the application to create a visitor session.
 - Check the table in pgAdmin:
 
@@ -347,4 +365,3 @@ LIMIT 50;
 - Do not expose PostgreSQL directly to untrusted networks.
 - Do not publish database credentials, private server addresses, or production configuration.
 - Sign out after using Reviewer or Admin functions on a shared device.
-

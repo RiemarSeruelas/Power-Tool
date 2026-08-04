@@ -18,6 +18,12 @@ const BASELINE = Symbol("powerToolPostgresBaseline");
 
 let pool;
 let ensurePromise;
+let reconnectPromise;
+let activeProvider = "json";
+let fallbackBaseline;
+let fallbackDirty = false;
+let lastPostgresConnectedAt = "";
+let lastPostgresError = "";
 
 function quotedIdentifier(value, label) {
   const identifier = String(value || "").trim();
@@ -81,6 +87,19 @@ function getPool() {
     });
   }
   return pool;
+}
+
+function postgresConnectionError(error) {
+  if (!error) return false;
+  const code = String(error.code || error.cause?.code || "").trim().toUpperCase();
+  const message = String(error.message || "").trim().toLowerCase();
+  return code.startsWith("08")
+    || ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "57P01", "57P02", "57P03"].includes(code)
+    || message.includes("connection terminated")
+    || message.includes("connection timeout")
+    || message.includes("connect econnrefused")
+    || message.includes("client has already been released")
+    || message.includes("cannot use a pool after calling end");
 }
 
 function serialized(value) {
@@ -471,31 +490,12 @@ async function writePostgresDb(db) {
   }
 }
 
-export async function initializeDataStore() {
-  if (POSTGRES_ENABLED) return ensurePostgres();
-  return jsonStore.readDb();
-}
-
-export async function readDb() {
-  if (POSTGRES_ENABLED) return readPostgresDb();
-  return jsonStore.readDb();
-}
-
-export async function writeDb(db) {
-  if (POSTGRES_ENABLED) return writePostgresDb(db);
-  return jsonStore.writeDb(db);
-}
-
 function limitedLogValue(value, maximum, fallback = "") {
   const normalized = String(value ?? "").trim();
   return (normalized || fallback).slice(0, maximum);
 }
 
-export async function recordPowerToolLog(entry = {}) {
-  if (!POSTGRES_ENABLED) {
-    return { stored: false, inserted: false, provider: "json" };
-  }
-
+async function recordPostgresLog(entry = {}) {
   await ensurePostgres();
   const eventType = limitedLogValue(entry.eventType, 60);
   const eventKey = limitedLogValue(entry.eventKey, 360);
@@ -555,14 +555,214 @@ export async function recordPowerToolLog(entry = {}) {
   }
 }
 
-export async function checkDb() {
+function applyCollectionDelta(target, key, baseline, desired) {
+  const targetRecords = new Map(
+    (Array.isArray(target[key]) ? target[key] : [])
+      .map((record) => [String(record?.id || "").trim(), record])
+      .filter(([id]) => id)
+  );
+  const baselineRecords = baseline?.collections?.[key] || new Map();
+  const desiredRecords = collectionMap(desired[key]);
+
+  for (const record of Array.isArray(desired[key]) ? desired[key] : []) {
+    const id = String(record?.id || "").trim();
+    if (!id || baselineRecords.get(id) === serialized(record)) continue;
+    targetRecords.set(id, structuredClone(record));
+  }
+  for (const id of baselineRecords.keys()) {
+    if (!desiredRecords.has(id)) targetRecords.delete(id);
+  }
+  target[key] = [...targetRecords.values()];
+}
+
+function applyFallbackDelta(postgresDb, localDb) {
+  const merged = postgresDb;
+  for (const key of Object.keys(COLLECTIONS)) {
+    applyCollectionDelta(merged, key, fallbackBaseline, localDb);
+  }
+  merged.usage = mergeUsage(
+    merged.usage || emptyUsage(),
+    fallbackBaseline?.usage || emptyUsage(),
+    localDb.usage || emptyUsage()
+  );
+  return merged;
+}
+
+function changedFallbackSessions(localDb) {
+  const baselineSessions = normalizeUsage(fallbackBaseline?.usage).sessions;
+  return Object.values(normalizeUsage(localDb.usage).sessions).filter((session) => {
+    const sessionId = String(session?.sessionId || "").trim();
+    return sessionId && serialized(session) !== serialized(baselineSessions[sessionId]);
+  });
+}
+
+function fallbackSessionDetails(session) {
+  return {
+    visitorType: session.visitorType || "visitor",
+    accountUsername: session.accountUsername || "",
+    accountDisplayName: session.accountDisplayName || "",
+    authenticated: Boolean(session.authenticated),
+    loginCount: Number(session.loginCount || 0),
+    loggedInAt: session.loggedInAt || "",
+    loggedOutAt: session.loggedOutAt || "",
+    sessionStatus: session.status || "active",
+    sessionEndedAt: session.endedAt || "",
+    firstPath: session.firstPath || "",
+    deviceType: session.deviceType || "Desktop",
+    browser: session.browser || "Unknown",
+    operatingSystem: session.operatingSystem || "Unknown"
+  };
+}
+
+async function mirrorPostgresDb(db) {
+  try {
+    await jsonStore.writeDb(db);
+  } catch (error) {
+    console.warn(`[Database] Could not refresh the local fallback copy: ${error.message}`);
+  }
+}
+
+async function activateJsonFallback(error) {
+  const localDb = await jsonStore.readDb();
+  if (activeProvider !== "json" || !fallbackBaseline) {
+    fallbackBaseline = baselineFor(localDb);
+    fallbackDirty = false;
+  }
+  activeProvider = "json";
+  if (error) lastPostgresError = String(error.message || error);
+  return localDb;
+}
+
+async function syncFallbackIntoPostgres() {
+  if (!fallbackDirty) return readPostgresDb();
+
+  const localDb = await jsonStore.readDb();
+  const offlineSessions = changedFallbackSessions(localDb);
+  const postgresDb = await readPostgresDb();
+  const saved = await writePostgresDb(applyFallbackDelta(postgresDb, localDb));
+
+  for (const session of offlineSessions) {
+    await recordPostgresLog({
+      eventType: "visitor_session",
+      eventKey: session.sessionId,
+      sessionId: session.sessionId,
+      ipAddress: session.ip || "unknown",
+      requestPath: session.path || session.firstPath || "",
+      requestMethod: "POST",
+      responseStatus: 200,
+      targetId: "",
+      details: fallbackSessionDetails(session)
+    });
+  }
+  return saved;
+}
+
+export function getDataStoreState() {
+  return {
+    provider: activeProvider,
+    configuredProvider: POSTGRES_ENABLED ? "postgresql" : "json",
+    fallback: POSTGRES_ENABLED && activeProvider === "json",
+    fallbackDirty,
+    lastPostgresConnectedAt: lastPostgresConnectedAt || null,
+    lastPostgresError: lastPostgresError || null
+  };
+}
+
+export async function initializeDataStore() {
+  const localDb = await jsonStore.readDb();
+  activeProvider = "json";
+  fallbackBaseline = baselineFor(localDb);
+  fallbackDirty = false;
+  return getDataStoreState();
+}
+
+export async function reconnectPostgres() {
   if (!POSTGRES_ENABLED) {
     await jsonStore.readDb();
-    return { ok: true, provider: "json" };
+    return getDataStoreState();
   }
-  await ensurePostgres();
-  await getPool().query("SELECT 1");
-  return { ok: true, provider: "postgresql", schema: schemaName() };
+
+  if (reconnectPromise) return reconnectPromise;
+  reconnectPromise = (async () => {
+    try {
+      await ensurePostgres();
+      await getPool().query("SELECT 1");
+      const postgresDb = await syncFallbackIntoPostgres();
+      await mirrorPostgresDb(postgresDb);
+      activeProvider = "postgresql";
+      fallbackBaseline = undefined;
+      fallbackDirty = false;
+      lastPostgresConnectedAt = new Date().toISOString();
+      lastPostgresError = "";
+      console.log(`[Database] PostgreSQL connected (schema ${schemaName()}).`);
+      return getDataStoreState();
+    } catch (error) {
+      lastPostgresError = String(error.message || error);
+      await activateJsonFallback(error);
+      throw error;
+    }
+  })().finally(() => {
+    reconnectPromise = undefined;
+  });
+  return reconnectPromise;
+}
+
+export async function readDb() {
+  if (activeProvider !== "postgresql") return jsonStore.readDb();
+  try {
+    return await readPostgresDb();
+  } catch (error) {
+    if (!postgresConnectionError(error)) throw error;
+    return activateJsonFallback(error);
+  }
+}
+
+export async function writeDb(db) {
+  if (activeProvider !== "postgresql") {
+    const saved = await jsonStore.writeDb(db);
+    fallbackDirty = POSTGRES_ENABLED;
+    return saved;
+  }
+  try {
+    const saved = await writePostgresDb(db);
+    await mirrorPostgresDb(saved);
+    return saved;
+  } catch (error) {
+    if (!postgresConnectionError(error)) throw error;
+    await activateJsonFallback(error);
+    const saved = await jsonStore.writeDb(db);
+    fallbackDirty = true;
+    return saved;
+  }
+}
+
+export async function recordPowerToolLog(entry = {}) {
+  if (activeProvider !== "postgresql") {
+    return { stored: false, inserted: false, provider: "json" };
+  }
+  try {
+    return await recordPostgresLog(entry);
+  } catch (error) {
+    if (!postgresConnectionError(error)) throw error;
+    await activateJsonFallback(error);
+    return { stored: false, inserted: false, provider: "json" };
+  }
+}
+
+export async function checkDb() {
+  if (activeProvider !== "postgresql") {
+    await jsonStore.readDb();
+    return { ok: true, provider: "json", fallback: POSTGRES_ENABLED };
+  }
+  try {
+    await ensurePostgres();
+    await getPool().query("SELECT 1");
+    return { ok: true, provider: "postgresql", schema: schemaName() };
+  } catch (error) {
+    if (!postgresConnectionError(error)) throw error;
+    await activateJsonFallback(error);
+    return { ok: true, provider: "json", fallback: true };
+  }
 }
 
 export async function closeDb() {
@@ -575,6 +775,6 @@ export async function closeDb() {
 }
 
 export function getDbPath() {
-  if (!POSTGRES_ENABLED) return jsonStore.getDbPath();
+  if (activeProvider !== "postgresql") return jsonStore.getDbPath();
   return `PostgreSQL (schema ${schemaName()})`;
 }

@@ -8,6 +8,7 @@
     "client": "vite --host 0.0.0.0",
     "server": "node server/index.js",
     "build": "vite build",
+    "test:fallback": "node scripts/offline-fallback-test.mjs",
     "test:migration": "node scripts/migration-test.mjs",
     "test:postgres": "node scripts/postgres-store-test.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",

@@ -77,6 +77,7 @@ const {
   closeDb,
   getDbPath,
   initializeDataStore,
+  reconnectPostgres,
   recordPowerToolLog,
   readDb,
   writeDb
@@ -84,6 +85,7 @@ const {
 const { isPasswordHash, verifyPassword } = await import("../server/passwords.js");
 
 await initializeDataStore();
+await reconnectPostgres();
 const imported = await readDb();
 assert.equal(imported.requests[0].id, "request-imported");
 assert.equal(imported.items[0].qrId, "QR-IMPORTED");

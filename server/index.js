@@ -7,8 +7,10 @@ import QRCode from "qrcode";
 import {
   checkDb,
   closeDb,
+  getDataStoreState,
   getDbPath,
   initializeDataStore,
+  reconnectPostgres,
   recordPowerToolLog,
   readDb,
   writeDb
@@ -24,6 +26,13 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT || 5057);
 const nanoid = customAlphabet("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", 8);
+const POSTGRES_ENABLED = /^(1|true|yes|on)$/i.test(
+  String(process.env.POSTGRES_ENABLED || "").trim()
+);
+const DATABASE_RETRY_INTERVAL_MS = Math.min(
+  300000,
+  Math.max(5000, Number(process.env.POSTGRES_RETRY_INTERVAL_MS || 15000) || 15000)
+);
 
 const TOOL_TYPE_IDS = ["cat-elc", "cat-portable-tool"];
 const QUESTION_TYPES = new Set(["text", "number", "date", "textarea", "radio", "checkboxes", "select", "yesno", "image"]);
@@ -34,12 +43,136 @@ app.set("trust proxy", Number.isInteger(trustProxy) && trustProxy >= 0 ? trustPr
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
+const databaseState = {
+  ready: false,
+  connecting: false,
+  lastConnectedAt: "",
+  lastError: ""
+};
+let databaseConnectionPromise;
+let databaseRetryTimer;
+let databaseMonitorTimer;
+let shuttingDown = false;
+
 function nowIso() {
   return new Date().toISOString();
 }
 
 function normalizeText(value) {
   return String(value ?? "").trim();
+}
+
+function publicDatabaseState() {
+  const store = getDataStoreState();
+  return {
+    ok: databaseState.ready,
+    provider: store.provider,
+    configuredProvider: store.configuredProvider,
+    status: !databaseState.ready
+      ? "initializing"
+      : store.provider === "postgresql"
+        ? "connected"
+        : store.fallback
+          ? "local-fallback"
+          : "connected",
+    ...(POSTGRES_ENABLED ? { schema: normalizeText(process.env.POSTGRES_SCHEMA || "app") || "app" } : {}),
+    fallback: store.fallback,
+    retrying: POSTGRES_ENABLED && store.provider !== "postgresql",
+    retryIntervalMs: POSTGRES_ENABLED ? DATABASE_RETRY_INTERVAL_MS : undefined,
+    lastConnectedAt: store.lastPostgresConnectedAt || databaseState.lastConnectedAt || null
+  };
+}
+
+function isDatabaseConnectionError(error) {
+  if (!POSTGRES_ENABLED || !error) return false;
+  const code = normalizeText(error.code || error.cause?.code).toUpperCase();
+  const message = normalizeText(error.message).toLowerCase();
+  return code.startsWith("08")
+    || ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "57P01", "57P02", "57P03"].includes(code)
+    || message.includes("connection terminated")
+    || message.includes("connection timeout")
+    || message.includes("connect econnrefused")
+    || message.includes("client has already been released")
+    || message.includes("cannot use a pool after calling end");
+}
+
+function scheduleDatabaseRetry(delay = DATABASE_RETRY_INTERVAL_MS) {
+  if (!POSTGRES_ENABLED || shuttingDown || databaseRetryTimer) return;
+  if (getDataStoreState().provider === "postgresql") return;
+  databaseRetryTimer = setTimeout(() => {
+    databaseRetryTimer = undefined;
+    attemptPostgresReconnect().catch(() => {});
+  }, delay);
+  databaseRetryTimer.unref?.();
+}
+
+function startDatabaseMonitor() {
+  if (!POSTGRES_ENABLED || databaseMonitorTimer) return;
+  databaseMonitorTimer = setInterval(() => {
+    if (shuttingDown || databaseState.connecting) return;
+    if (getDataStoreState().provider !== "postgresql") {
+      attemptPostgresReconnect().catch(() => {});
+      return;
+    }
+    checkDb()
+      .then((result) => {
+        if (result.provider !== "postgresql") scheduleDatabaseRetry(0);
+      })
+      .catch((error) => markDatabaseUnavailable(error));
+  }, DATABASE_RETRY_INTERVAL_MS);
+  databaseMonitorTimer.unref?.();
+}
+
+function markDatabaseUnavailable(error) {
+  const message = normalizeText(error?.message) || "Unknown database connection error";
+  const shouldLog = databaseState.lastError !== message;
+  databaseState.lastError = message;
+  if (shouldLog) {
+    console.warn(`[Database] PostgreSQL unavailable: ${message}. Using the local fallback and retrying in ${DATABASE_RETRY_INTERVAL_MS}ms.`);
+  }
+  scheduleDatabaseRetry();
+}
+
+async function attemptPostgresReconnect() {
+  if (!POSTGRES_ENABLED || shuttingDown || databaseState.connecting) return;
+  databaseState.connecting = true;
+  try {
+    const state = await reconnectPostgres();
+    databaseState.lastConnectedAt = state.lastPostgresConnectedAt || nowIso();
+    databaseState.lastError = "";
+  } catch (error) {
+    markDatabaseUnavailable(error);
+  } finally {
+    databaseState.connecting = false;
+  }
+}
+
+async function connectDataStore() {
+  if (databaseConnectionPromise) return databaseConnectionPromise;
+  databaseConnectionPromise = (async () => {
+    await initializeDataStore();
+    let db = await readDb();
+    if (syncConfiguredAdmin(db)) db = await writeDb(db);
+    const usage = ensureUsage(db);
+
+    databaseState.ready = true;
+    databaseState.lastError = "";
+
+    console.log(`[Database] Active store: ${getDbPath()}`);
+    logUsage(usage, "stored totals");
+    logUsageByIp(usage);
+    if (POSTGRES_ENABLED) scheduleDatabaseRetry(0);
+  })()
+    .catch((error) => {
+      databaseState.lastError = normalizeText(error?.message) || "Local data store initialization failed.";
+      console.error(`[Database] Local fallback failed: ${databaseState.lastError}`);
+      throw error;
+    })
+    .finally(() => {
+      databaseConnectionPromise = undefined;
+    });
+
+  return databaseConnectionPromise;
 }
 
 function hasAnswer(value) {
@@ -820,9 +953,22 @@ function sortItemsDefault(a, b) {
   return new Date(a.expiresAt || 0) - new Date(b.expiresAt || 0);
 }
 
-app.get("/api/health", async (req, res) => {
-  const database = await checkDb();
-  res.json({ ok: true, database, time: nowIso() });
+app.get("/api/health", (req, res) => {
+  res.status(databaseState.ready ? 200 : 503).json({
+    ok: databaseState.ready,
+    database: publicDatabaseState(),
+    time: nowIso()
+  });
+});
+
+app.use("/api", (req, res, next) => {
+  if (databaseState.ready) return next();
+  scheduleDatabaseRetry(0);
+  res.set("Retry-After", String(Math.ceil(DATABASE_RETRY_INTERVAL_MS / 1000)));
+  return res.status(503).json({
+    error: "The Power Tool local data store is still initializing.",
+    database: publicDatabaseState()
+  });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -1380,6 +1526,14 @@ app.get(/.*/, (req, res, next) => {
 
 app.use((err, req, res, next) => {
   console.error(err);
+  if (isDatabaseConnectionError(err)) {
+    markDatabaseUnavailable(err);
+    res.set("Retry-After", String(Math.ceil(DATABASE_RETRY_INTERVAL_MS / 1000)));
+    return res.status(503).json({
+      error: "The Power Tool database connection was interrupted. The application will reconnect automatically.",
+      database: publicDatabaseState()
+    });
+  }
   const body = { error: "Server error." };
   if (/^(1|true|yes|on)$/i.test(String(process.env.EXPOSE_ERROR_DETAILS || ""))) {
     body.detail = err.message;
@@ -1390,20 +1544,23 @@ app.use((err, req, res, next) => {
 let httpServer;
 
 async function startServer() {
-  await initializeDataStore();
-  let db = await readDb();
-  if (syncConfiguredAdmin(db)) db = await writeDb(db);
-  const usage = ensureUsage(db);
-
   httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Power Tool backend listening on port ${PORT}`);
-    console.log(`Database: ${getDbPath()}`);
-    logUsage(usage, "stored totals");
-    logUsageByIp(usage);
+    startDatabaseMonitor();
+    connectDataStore().catch(() => {});
   });
 }
 
 async function shutdown(signal) {
+  shuttingDown = true;
+  if (databaseRetryTimer) {
+    clearTimeout(databaseRetryTimer);
+    databaseRetryTimer = undefined;
+  }
+  if (databaseMonitorTimer) {
+    clearInterval(databaseMonitorTimer);
+    databaseMonitorTimer = undefined;
+  }
   console.log(`[Server] ${signal} received. Closing connections.`);
   if (httpServer) {
     await new Promise((resolve) => httpServer.close(resolve));
