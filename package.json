@@ -1,0 +1,35 @@
+{
+  "name": "power-tool-system",
+  "version": "6.3.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "client": "vite --host 0.0.0.0",
+    "server": "node server/index.js",
+    "build": "vite build",
+    "test:migration": "node scripts/migration-test.mjs",
+    "test:postgres": "node scripts/postgres-store-test.mjs",
+    "test:smoke": "node scripts/smoke-test.mjs",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.2.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "html5-qrcode": "^2.3.8",
+    "jsqr": "^1.4.0",
+    "lucide-react": "^0.468.0",
+    "nanoid": "^5.1.5",
+    "pg": "^8.22.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vite": "^7.0.0"
+  },
+  "devDependencies": {
+    "pg-mem": "^3.0.14"
+  }
+}
